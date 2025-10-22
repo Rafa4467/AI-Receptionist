@@ -1,4 +1,4 @@
-package com.rafael;
+package com.rafael.aireceptionistapi.controller;
 
 import org.springframework.web.bind.annotation.*;
 
