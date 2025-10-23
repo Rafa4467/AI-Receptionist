@@ -7,6 +7,7 @@ import com.twilio.twiml.voice.Record;
 import com.twilio.twiml.TwiMLException;
 import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.*;
+import com.rafael.aireceptionistapi.ai.LlmService;
 
 import java.util.Locale;
 
@@ -44,6 +45,9 @@ public class VoiceController {
         return resp.toXml();
     }
 
+    private final LlmService llm;
+    public VoiceController(LlmService llm) { this.llm = llm; }
+
     // 2) Auswertung der Spracherkennung
     @PostMapping("/gather")
     public String gathered(@RequestParam(value="SpeechResult", required=false) String speech) throws TwiMLException {
@@ -68,15 +72,19 @@ public class VoiceController {
             // Für echtes Durchstellen: <Dial> mit Zielnummer implementieren
         }
 
-        // Nichts Passendes -> nochmal fragen oder Voicemail anbieten
-        VoiceResponse resp = new VoiceResponse.Builder()
-                .say(new Say.Builder("Das habe ich leider nicht verstanden. Möchten Sie eine Nachricht hinterlassen?")
-                        .voice(Say.Voice.ALICE).language(Say.Language.DE_DE).build())
-                .gather(new Gather.Builder().inputs(Gather.Input.SPEECH).language(Gather.Language.DE_DE)
-                        .action("/voice/voicemail-choice").timeout(4).build())
-                .build();
-        return resp.toXml();
+
+        // --- AI-Fallback kommt hier ---
+        String systemPrompt = """
+        Du bist der freundliche, präzise Telefon-Rezeptionist eines Restaurants in Wien.
+        Sprich kurz, höflich und auf Deutsch. Bei Reservierungen frage nacheinander nach:
+        Personenzahl, Datum, Uhrzeit, Name und Telefonnummer. Stelle höchstens EINE klärende Frage.
+        """;
+        String aiText = llm.reply(systemPrompt, "Anrufer sagt: " + utterance);
+        return sayAndGather(aiText);   // <-- ersetzt den alten "return resp.toXml()"
+
     }
+
+
 
     // 3) Voicemail: Nachricht aufnehmen & (optional) transkribieren
     @PostMapping("/voicemail")
