@@ -24,7 +24,7 @@ public class LlmService {
             return "Ich antworte gern intelligent, sobald der AI-Schlüssel gesetzt ist.";
         }
         var body = Map.of(
-                "model", "gpt-4o-mini",
+                "model", "gpt-4o-mini-fast",
                 "temperature", 0.4,
                 "messages", new Object[] {
                         Map.of("role", "system", "content", system),
