@@ -1,4 +1,4 @@
-package com.rafael.aireceptionistapi.WebsiteExtraction;
+package com.rafael.aireceptionistapi.knowledge;
 
 import org.springframework.data.jpa.repository.JpaRepository;
 

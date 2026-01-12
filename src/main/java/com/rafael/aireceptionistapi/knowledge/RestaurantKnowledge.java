@@ -1,4 +1,4 @@
-package com.rafael.aireceptionistapi.WebsiteExtraction;
+package com.rafael.aireceptionistapi.knowledge;
 
 import jakarta.persistence.*;
 import java.time.OffsetDateTime;
