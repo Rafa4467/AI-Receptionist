@@ -38,36 +38,15 @@ public class VoiceController {
     // 1) Einstieg
     @PostMapping("/incoming")
     public String incoming() throws TwiMLException {
-        String greetText =
-                "Hallo und herzlich willkommen bei Viva la Mamma! Vielen Dank für Ihren Anruf. " +
-                        "Geht es um eine Reservierung, das Menü oder etwas anderes?";
 
-        String url = tts.synthesizeToUrl(greetText, PUBLIC_BASE_URL);
-
-        VoiceResponse.Builder resp = new VoiceResponse.Builder();
-
-        if (url == null || url.isBlank()) {
-            resp.say(new Say.Builder(greetText)
-                    .language(Say.Language.DE_DE)
-                    .voice(Say.Voice.ALICE)
-                    .build());
-        } else {
-            // Jetzt WAV statt MP3
-            resp.play(new Play.Builder(url).build());
-        }
-
-        resp.gather(new Gather.Builder()
-                .inputs(Gather.Input.SPEECH)
-                .language(Gather.Language.DE_DE)
-                .action("/voice/gather")
-                .method(com.twilio.http.HttpMethod.POST)
-                // natürlicher & schneller weiter
-                .timeout(4)
-                .speechTimeout("auto")
-                .build());
-
-        return resp.build().toXml();
+        return new VoiceResponse.Builder()
+                .play(new Play.Builder(
+                        "https://www2.cs.uic.edu/~i101/SoundFiles/StarWars60.wav"
+                ).build())
+                .build()
+                .toXml();
     }
+
 
     // 2) Auswertung
     @PostMapping("/gather")
