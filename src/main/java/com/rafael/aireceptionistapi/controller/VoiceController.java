@@ -52,6 +52,7 @@ public class VoiceController {
                     .voice(Say.Voice.ALICE)
                     .build());
         } else {
+            // Jetzt WAV statt MP3
             resp.play(new Play.Builder(url).build());
         }
 
@@ -60,8 +61,9 @@ public class VoiceController {
                 .language(Gather.Language.DE_DE)
                 .action("/voice/gather")
                 .method(com.twilio.http.HttpMethod.POST)
-                .timeout(8)
-                .speechTimeout("2")
+                // natürlicher & schneller weiter
+                .timeout(4)
+                .speechTimeout("auto")
                 .build());
 
         return resp.build().toXml();
@@ -156,6 +158,7 @@ public class VoiceController {
                     .voice(Say.Voice.ALICE)
                     .build());
         } else {
+            // WAV statt MP3
             resp.play(new Play.Builder(url).build());
         }
 
@@ -189,6 +192,7 @@ public class VoiceController {
                     .voice(Say.Voice.ALICE)
                     .build());
         } else {
+            // WAV statt MP3
             resp.play(new Play.Builder(url).build());
         }
 
@@ -197,8 +201,9 @@ public class VoiceController {
                 .language(Gather.Language.DE_DE)
                 .action("/voice/gather")
                 .method(com.twilio.http.HttpMethod.POST)
-                .timeout(8)
-                .speechTimeout("2")
+                // natürlicher & weniger awkward pauses
+                .timeout(4)
+                .speechTimeout("auto")
                 .build());
 
         return resp.build().toXml();
