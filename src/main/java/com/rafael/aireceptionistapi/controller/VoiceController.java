@@ -39,13 +39,24 @@ public class VoiceController {
     @PostMapping("/incoming")
     public String incoming() throws TwiMLException {
 
+        String wsBase = System.getenv().getOrDefault(
+                "PUBLIC_WSS_BASE",
+                "wss://ai-receptionist-production-4df6.up.railway.app"
+        );
+
+        String streamUrl = wsBase + "/twilio-media";
+
         return new VoiceResponse.Builder()
-                .play(new Play.Builder(
-                        "https://www2.cs.uic.edu/~i101/SoundFiles/StarWars60.wav"
-                ).build())
+                .connect(new Connect.Builder()
+                        .stream(new Stream.Builder()
+                                .url(streamUrl)
+                                .build())
+                        .build())
                 .build()
                 .toXml();
     }
+
+
 
 
     // 2) Auswertung
