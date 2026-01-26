@@ -22,8 +22,8 @@ public class LlmService {
     public String reply(String system, String user) {
         try {
             var body = Map.of(
-                    "model", "gpt-4o-mini-2025",
-                    "temperature", 0.3,
+                    "model", "gpt-4o-mini",
+                    "temperature", 0.25,
                     "messages", new Object[]{
                             Map.of("role", "system", "content", system),
                             Map.of("role", "user", "content", user)
