@@ -30,7 +30,7 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
     @Override
     public void afterConnectionEstablished(WebSocketSession twilioSession) throws Exception {
         String apiKey = System.getenv("OPENAI_API_KEY");
-        String model = System.getenv().getOrDefault("OPENAI_REALTIME_MODEL", "gpt-4o-mini-realtime");
+        String model = System.getenv().getOrDefault("OPENAI_REALTIME_MODEL", "gpt-4o-mini-realtime-");
 
         if (apiKey == null || apiKey.isBlank()) {
             log.error("OPENAI_API_KEY fehlt!");
@@ -91,13 +91,6 @@ Kein Vorlesen, kein Aufzählen, kein Roboterstil.
     "instructions": %s,
 
     "voice": "nova",
-
-    "voice_settings": {
-      "stability": 0.45,
-      "similarity_boost": 0.65,
-      "style": 0.55,
-      "use_speaker_boost": true
-    },
 
     "input_audio_format": "g711_ulaw",
     "output_audio_format": "g711_ulaw",
