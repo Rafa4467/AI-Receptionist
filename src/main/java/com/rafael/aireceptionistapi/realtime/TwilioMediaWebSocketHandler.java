@@ -20,6 +20,7 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
     private static final Logger log = LoggerFactory.getLogger(TwilioMediaWebSocketHandler.class);
     private static final ObjectMapper M = new ObjectMapper();
 
+    // Wichtig: keine Read-Timeouts für WebSockets
     private final OkHttpClient client = new OkHttpClient.Builder()
             .callTimeout(Duration.ZERO)
             .readTimeout(Duration.ZERO)
@@ -29,16 +30,22 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
 
     @Override
     public void afterConnectionEstablished(WebSocketSession twilioSession) throws Exception {
+
         String apiKey = System.getenv("OPENAI_API_KEY");
-        String model = System.getenv().getOrDefault("OPENAI_REALTIME_MODEL", "gpt-4o-mini-realtime-");
+        String model  = System.getenv().getOrDefault("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview");
+
+        // "Nicht reingrätschen": default FALSE
+        boolean bargeIn = Boolean.parseBoolean(System.getenv().getOrDefault("BARGE_IN", "false"));
 
         if (apiKey == null || apiKey.isBlank()) {
-            log.error("OPENAI_API_KEY fehlt!");
+            log.error("OPENAI_API_KEY fehlt! -> WS wird geschlossen");
             twilioSession.close(CloseStatus.SERVER_ERROR);
             return;
         }
 
         AtomicReference<String> streamSidRef = new AtomicReference<>(null);
+
+        // Audio puffern, falls OpenAI schneller spricht als Twilio "start" liefert
         Queue<String> pendingAudio = new ConcurrentLinkedQueue<>();
 
         Request req = new Request.Builder()
@@ -47,66 +54,65 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
                 .addHeader("OpenAI-Beta", "realtime=v1")
                 .build();
 
+        log.info("Twilio WS connected. Opening OpenAI Realtime WS (model={}) ...", model);
+
         WebSocket openaiWs = client.newWebSocket(req, new WebSocketListener() {
 
             @Override
             public void onOpen(WebSocket webSocket, Response response) {
+                log.info("OpenAI WS OPEN ✅ status={} message={}", response.code(), response.message());
 
                 String instructions = """
-                        Du bist KEIN Chatbot.
-Du bist eine echte Person am Telefon.
-Du bist die Telefon-Rezeptionistin von „Viva la Mamma“.
+                        Du bist KEIN Chatbot. Du bist eine echte Person am Telefon.
+                        Du bist die Telefon-Rezeptionistin von „Viva la Mamma“.
+                        Sprich ausschließlich Deutsch (de-DE).
+                        Stimme: ruhig, warm, natürlich, menschlich.
+                        Antworte in ganzen, natürlichen Sätzen.
+                        Normal: max. 1–2 Sätze. Bei Reservierung darfst du länger.
 
-Sprich ausschließlich Deutsch (de-DE).
-Deine Stimme ist ruhig, warm, natürlich, menschlich.
-Du klingst wie eine echte Mitarbeiterin, nicht wie KI.
+                        Beginne oft weich:
+                        „Ja, sehr gerne.“
+                        „Natürlich.“
+                        „Einen kleinen Moment bitte.“
 
-Antworte immer in ganzen, natürlichen Sätzen.
-Maximal 1–2 Sätze, außer es ist eine Reservierung.
+                        Bei Reservierungen frage IMMER nacheinander:
+                        1) Für wie viele Personen?
+                        2) Für welches Datum?
+                        3) Um wie viel Uhr?
+                        4) Auf welchen Namen?
+                        5) Telefonnummer?
 
-Beginne Antworten oft weich:
-„Ja, sehr gerne.“
-„Natürlich.“
-„Einen kleinen Moment bitte.“
+                        Wenn du unsicher bist: sag das ehrlich und biete an zu verbinden.
+                        Kein Vorlesen, kein Aufzählen, keine Listen.
+                        """;
 
-Bei Reservierungen:
-Frage IMMER nacheinander:
-– Für wie viele Personen?
-– Für welches Datum?
-– Um wie viel Uhr?
-– Auf welchen Namen?
-– Telefonnummer?
-
-Wenn du unsicher bist:
-Sag das ehrlich und biete an, zu verbinden.
-
-Mache kleine natürliche Pausen.
-Kein Vorlesen, kein Aufzählen, kein Roboterstil.
-""";
-
+                // session.update (mit Voice Settings)
                 sendJson(webSocket, """
-{
-  "type": "session.update",
-  "session": {
-    "instructions": %s,
+                {
+                  "type": "session.update",
+                  "session": {
+                    "instructions": %s,
+                    "voice": "nova",
+                    "voice_settings": {
+                      "stability": 0.45,
+                      "similarity_boost": 0.65,
+                      "style": 0.55,
+                      "use_speaker_boost": true
+                    },
+                    "input_audio_format": "g711_ulaw",
+                    "output_audio_format": "g711_ulaw",
+                    "turn_detection": {
+                      "type": "server_vad",
+                      "threshold": 0.55,
+                      "prefix_padding_ms": 200,
+                      "silence_duration_ms": 420
+                    },
+                    "temperature": 0.25
+                  }
+                }
+                """.formatted(jsonString(instructions)));
 
-    "voice": "nova",
-
-    "input_audio_format": "g711_ulaw",
-    "output_audio_format": "g711_ulaw",
-
-    "turn_detection": {
-      "type": "server_vad",
-      "threshold": 0.55,
-      "prefix_padding_ms": 200,
-      "silence_duration_ms": 420
-    },
-
-    "temperature": 0.25
-  }
-}
-""".formatted(jsonString(instructions)));
-
+                // Greeting
                 sendJson(webSocket, """
                 {
                   "type":"conversation.item.create",
@@ -140,115 +146,106 @@ Kein Vorlesen, kein Aufzählen, kein Roboterstil.
                             pendingAudio.add(audioB64);
                             return;
                         }
-
-                        safeSend(twilioSession,
-                                "{\"event\":\"media\",\"streamSid\":\"" + streamSid +
-                                        "\",\"media\":{\"payload\":\"" + audioB64 + "\"}}");
+                        sendAudioToTwilio(twilioSession, streamSid, audioB64);
+                        return;
                     }
 
-                    if ("input_audio_buffer.speech_started".equals(type)) {
+                    // OPTIONAL: Barge-in nur wenn du es willst
+                    if (bargeIn && "input_audio_buffer.speech_started".equals(type)) {
                         String streamSid = streamSidRef.get();
                         if (streamSid != null) {
-                            safeSend(twilioSession,
-                                    "{\"event\":\"clear\",\"streamSid\":\"" + streamSid + "\"}");
+                            safeSend(twilioSession, "{\"event\":\"clear\",\"streamSid\":\"" + streamSid + "\"}");
                         }
                         sendJson(webSocket, "{\"type\":\"response.cancel\"}");
+                        return;
                     }
 
+                    // Wenn User fertig spricht -> commit + response
                     if ("input_audio_buffer.speech_stopped".equals(type)) {
                         sendJson(webSocket, "{\"type\":\"input_audio_buffer.commit\"}");
-                        sendJson(webSocket, """
-                        { "type": "response.cancel" }
-                        """);
-                        sendJson(webSocket,
-                                "{\"type\":\"response.create\",\"response\":{\"modalities\":[\"audio\"]}}");
+                        sendJson(webSocket, "{\"type\":\"response.create\",\"response\":{\"modalities\":[\"audio\"]}}");
+                        return;
+                    }
+
+                    if ("error".equals(type)) {
+                        log.error("OpenAI realtime error: {}", text);
                     }
 
                 } catch (Exception e) {
-                    log.warn("OpenAI parse error", e);
+                    log.warn("OpenAI parse error: {}", e.getMessage());
                 }
             }
 
             @Override
             public void onFailure(WebSocket webSocket, Throwable t, Response response) {
-                log.error("OpenAI WS FAILED: {}", t.getMessage());
+                log.error("OpenAI WS FAILED ❌ {} (response={})",
+                        t.getMessage(), response != null ? response.code() : "null");
+                try { twilioSession.close(CloseStatus.SERVER_ERROR); } catch (Exception ignore) {}
+            }
 
-                // ❌ NICHT den ganzen Server töten
-                // ❌ NICHT RuntimeException werfen
-
-                try {
-                    if (twilioSession.isOpen()) {
-                        safeSend(twilioSession,
-                                "{\"event\":\"clear\",\"streamSid\":\"" + streamSidRef.get() + "\"}");
-                        twilioSession.close();
-                    }
-                } catch (Exception ignored) {}
+            private void sendAudioToTwilio(WebSocketSession twilioSession, String streamSid, String audioB64) {
+                String twilioMsg = "{\"event\":\"media\",\"streamSid\":\"" + streamSid + "\",\"media\":{\"payload\":\"" + audioB64 + "\"}}";
+                safeSend(twilioSession, twilioMsg);
             }
         });
 
         twilioSession.getAttributes().put("openaiWs", openaiWs);
         twilioSession.getAttributes().put("streamSidRef", streamSidRef);
         twilioSession.getAttributes().put("pendingAudio", pendingAudio);
+        twilioSession.getAttributes().put("bargeIn", bargeIn);
     }
 
     @Override
     protected void handleTextMessage(WebSocketSession twilioSession, TextMessage message) throws Exception {
 
         WebSocket openaiWs = (WebSocket) twilioSession.getAttributes().get("openaiWs");
-        if (openaiWs == null) {
-            // OpenAI WS noch nicht bereit → nichts tun
-            return;
-        }
+        if (openaiWs == null) return;
 
         @SuppressWarnings("unchecked")
         AtomicReference<String> streamSidRef =
                 (AtomicReference<String>) twilioSession.getAttributes().get("streamSidRef");
 
+        @SuppressWarnings("unchecked")
+        Queue<String> pendingAudio =
+                (Queue<String>) twilioSession.getAttributes().get("pendingAudio");
+
         JsonNode n = M.readTree(message.getPayload());
         String event = n.path("event").asText();
 
-    /* -------------------------
-       START (Twilio Stream init)
-       ------------------------- */
         if ("start".equals(event)) {
             String streamSid = n.path("start").path("streamSid").asText();
             streamSidRef.set(streamSid);
-            log.info("Twilio stream started: {}", streamSid);
+            log.info("Twilio start ✅ streamSid={}", streamSid);
+
+            // 🔥 Wichtig: buffered audio flushen
+            String audio;
+            while ((audio = pendingAudio.poll()) != null) {
+                safeSend(twilioSession,
+                        "{\"event\":\"media\",\"streamSid\":\"" + streamSid + "\",\"media\":{\"payload\":\"" + audio + "\"}}");
+            }
             return;
         }
 
-    /* -------------------------
-       MEDIA (Audio vom User)
-       ------------------------- */
         if ("media".equals(event)) {
             String payload = n.path("media").path("payload").asText();
-
-            // 1️⃣ Audio an OpenAI anhängen
-            openaiWs.send(
-                    "{\"type\":\"input_audio_buffer.append\",\"audio\":\"" + payload + "\"}"
-            );
-
+            openaiWs.send("{\"type\":\"input_audio_buffer.append\",\"audio\":\"" + payload + "\"}");
             return;
         }
 
-    /* -------------------------
-       STOP (Call beendet)
-       ------------------------- */
         if ("stop".equals(event)) {
             log.info("Twilio stop received");
-
-            try {
-                // OpenAI sauber beenden
-                openaiWs.send("{\"type\":\"input_audio_buffer.commit\"}");
-                openaiWs.send("{\"type\":\"response.cancel\"}");
-            } catch (Exception ignore) {}
-
-            try {
-                twilioSession.close();
-            } catch (Exception ignore) {}
-
-            return;
+            try { openaiWs.send("{\"type\":\"input_audio_buffer.commit\"}"); } catch (Exception ignore) {}
+            try { twilioSession.close(); } catch (Exception ignore) {}
         }
+    }
+
+    @Override
+    public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
+        Object ws = session.getAttributes().get("openaiWs");
+        if (ws instanceof WebSocket ows) {
+            try { ows.close(1000, "twilio closed"); } catch (Exception ignore) {}
+        }
+        log.info("Twilio WS closed: {}", status);
     }
 
     private static void sendJson(WebSocket ws, String json) {
@@ -262,9 +259,7 @@ Kein Vorlesen, kein Aufzählen, kein Roboterstil.
     private static void safeSend(WebSocketSession session, String payload) {
         try {
             synchronized (session) {
-                if (session.isOpen()) {
-                    session.sendMessage(new TextMessage(payload));
-                }
+                if (session.isOpen()) session.sendMessage(new TextMessage(payload));
             }
         } catch (Exception ignore) {}
     }
