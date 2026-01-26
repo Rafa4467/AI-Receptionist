@@ -10,6 +10,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 @RestController
+@RequestMapping(value = "/voice", produces = MediaType.APPLICATION_XML_VALUE)
 public class VoiceController {
 
     /**
@@ -22,24 +23,15 @@ public class VoiceController {
      * Die komplette Sprache + Logik passiert im Realtime WebSocket
      * (TwilioMediaWebSocketHandler)
      */
-    @PostMapping(
-            value = "/voice/incoming",
-            produces = MediaType.APPLICATION_XML_VALUE
-    )    public String incoming() throws TwiMLException {
-
+    @PostMapping("/incoming")
+    public String incoming() throws TwiMLException {
         String wssBase = System.getenv("PUBLIC_WSS_BASE");
-        if (wssBase == null || wssBase.isBlank()) {
-            throw new IllegalStateException("PUBLIC_WSS_BASE is not set");
-        }
+        if (wssBase == null || wssBase.isBlank()) throw new IllegalStateException("PUBLIC_WSS_BASE is not set");
 
         VoiceResponse response = new VoiceResponse.Builder()
                 .connect(new Connect.Builder()
-                        .stream(new Stream.Builder()
-                                .url(wssBase + "/twilio-media")
-                                .build()
-                        )
-                        .build()
-                )
+                        .stream(new Stream.Builder().url(wssBase + "/twilio-media").build())
+                        .build())
                 .build();
 
         return response.toXml();
