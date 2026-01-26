@@ -178,8 +178,18 @@ Kein Vorlesen, kein Aufzählen, kein Roboterstil.
 
             @Override
             public void onFailure(WebSocket webSocket, Throwable t, Response response) {
-                log.error("OpenAI WS failure", t);
-                try { twilioSession.close(); } catch (Exception ignore) {}
+                log.error("OpenAI WS FAILED: {}", t.getMessage());
+
+                // ❌ NICHT den ganzen Server töten
+                // ❌ NICHT RuntimeException werfen
+
+                try {
+                    if (twilioSession.isOpen()) {
+                        safeSend(twilioSession,
+                                "{\"event\":\"clear\",\"streamSid\":\"" + streamSidRef.get() + "\"}");
+                        twilioSession.close();
+                    }
+                } catch (Exception ignored) {}
             }
         });
 
@@ -190,25 +200,61 @@ Kein Vorlesen, kein Aufzählen, kein Roboterstil.
 
     @Override
     protected void handleTextMessage(WebSocketSession twilioSession, TextMessage message) throws Exception {
+
         WebSocket openaiWs = (WebSocket) twilioSession.getAttributes().get("openaiWs");
+        if (openaiWs == null) {
+            // OpenAI WS noch nicht bereit → nichts tun
+            return;
+        }
+
+        @SuppressWarnings("unchecked")
+        AtomicReference<String> streamSidRef =
+                (AtomicReference<String>) twilioSession.getAttributes().get("streamSidRef");
 
         JsonNode n = M.readTree(message.getPayload());
         String event = n.path("event").asText();
 
+    /* -------------------------
+       START (Twilio Stream init)
+       ------------------------- */
         if ("start".equals(event)) {
-            AtomicReference<String> streamSidRef =
-                    (AtomicReference<String>) twilioSession.getAttributes().get("streamSidRef");
-            streamSidRef.set(n.path("start").path("streamSid").asText());
+            String streamSid = n.path("start").path("streamSid").asText();
+            streamSidRef.set(streamSid);
+            log.info("Twilio stream started: {}", streamSid);
             return;
         }
 
+    /* -------------------------
+       MEDIA (Audio vom User)
+       ------------------------- */
         if ("media".equals(event)) {
             String payload = n.path("media").path("payload").asText();
-            openaiWs.send("{\"type\":\"input_audio_buffer.append\",\"audio\":\"" + payload + "\"}");
+
+            // 1️⃣ Audio an OpenAI anhängen
+            openaiWs.send(
+                    "{\"type\":\"input_audio_buffer.append\",\"audio\":\"" + payload + "\"}"
+            );
+
+            return;
         }
 
+    /* -------------------------
+       STOP (Call beendet)
+       ------------------------- */
         if ("stop".equals(event)) {
-            try { twilioSession.close(); } catch (Exception ignore) {}
+            log.info("Twilio stop received");
+
+            try {
+                // OpenAI sauber beenden
+                openaiWs.send("{\"type\":\"input_audio_buffer.commit\"}");
+                openaiWs.send("{\"type\":\"response.cancel\"}");
+            } catch (Exception ignore) {}
+
+            try {
+                twilioSession.close();
+            } catch (Exception ignore) {}
+
+            return;
         }
     }
 
