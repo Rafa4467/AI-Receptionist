@@ -119,15 +119,15 @@ Beende den Anruf immer warm und positiv:
                            "type": "session.update",
                            "session": {
                              "instructions": "...DEIN TEXT + die 3 Nova-Linien...",
-                             "voice": "shimmer",
+                             "voice": "coral",
                              "input_audio_format": "g711_ulaw",
                              "output_audio_format": "g711_ulaw",
                              "turn_detection": {
                                "type": "server_vad",
                                "interrupt_response": false,
-                               "threshold": 0.50,
+                               "threshold": 0.45,
                                "prefix_padding_ms": 120,
-                               "silence_duration_ms": 320
+                               "silence_duration_ms": 250
                              },
                              "temperature": 0.8
                            }
