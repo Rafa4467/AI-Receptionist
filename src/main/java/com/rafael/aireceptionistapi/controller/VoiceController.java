@@ -25,15 +25,31 @@ public class VoiceController {
      */
     @PostMapping("/incoming")
     public String incoming() throws TwiMLException {
+
         String wssBase = System.getenv("PUBLIC_WSS_BASE");
-        if (wssBase == null || wssBase.isBlank()) throw new IllegalStateException("PUBLIC_WSS_BASE is not set");
 
-        VoiceResponse response = new VoiceResponse.Builder()
+        // Fallback statt Exception -> Twilio bekommt IMMER gültiges TwiML zurück
+        if (wssBase == null || wssBase.isBlank()) {
+            return new VoiceResponse.Builder()
+                    .say(new com.twilio.twiml.voice.Say.Builder(
+                            "Konfiguration fehlt. PUBLIC_WSS_BASE ist nicht gesetzt."
+                    ).build())
+                    .hangup(new com.twilio.twiml.voice.Hangup.Builder().build())
+                    .build()
+                    .toXml();
+        }
+
+        // kleine Normalisierung (kein doppelte Slash)
+        wssBase = wssBase.replaceAll("/+$", "");
+        String wsUrl = wssBase + "/twilio-media";
+
+        return new VoiceResponse.Builder()
                 .connect(new Connect.Builder()
-                        .stream(new Stream.Builder().url(wssBase + "/twilio-media").build())
+                        .stream(new Stream.Builder()
+                                .url(wsUrl)
+                                .build())
                         .build())
-                .build();
-
-        return response.toXml();
+                .build()
+                .toXml();
     }
 }
