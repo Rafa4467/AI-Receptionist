@@ -39,6 +39,7 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
             return;
         }
 
+        // Twilio sendet "start" manchmal später -> Audio puffern bis streamSid da ist
         AtomicReference<String> streamSidRef = new AtomicReference<>(null);
         Queue<String> pendingAudio = new ConcurrentLinkedQueue<>();
 
@@ -84,7 +85,7 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
                 }
                 """.formatted(jsonString(instructions)));
 
-                // ✅ WICHTIG: input_text statt text
+                // ✅ input_text statt text
                 sendJson(ws, """
                 {
                   "type":"conversation.item.create",
@@ -96,7 +97,7 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
                 }
                 """);
 
-                // ✅ WICHTIG: modalities = ["audio","text"]
+                // ✅ modalities = ["audio","text"]
                 sendJson(ws, """
                 {"type":"response.create","response":{"modalities":["audio","text"]}}
                 """);
@@ -108,14 +109,22 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
                     JsonNode n = M.readTree(text);
                     String type = n.path("type").asText();
 
+                    // ===== B) Debug: OpenAI event types =====
+                    log.info("OPENAI type={}", type);
+
                     if ("response.output_audio.delta".equals(type)) {
                         String audioB64 = n.path("delta").asText();
-                        String streamSid = streamSidRef.get();
 
+                        // ===== B) Debug: audio delta length =====
+                        log.info("OPENAI audio delta len={}", audioB64 != null ? audioB64.length() : -1);
+
+                        String streamSid = streamSidRef.get();
                         if (streamSid == null) {
                             pendingAudio.add(audioB64);
+                            log.info("OPENAI audio buffered (no streamSid yet) bufferedCount~{}", pendingAudio.size());
                             return;
                         }
+
                         sendAudioToTwilio(twilioSession, streamSid, audioB64);
                         return;
                     }
@@ -124,20 +133,23 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
                         String streamSid = streamSidRef.get();
                         if (streamSid != null) {
                             safeSend(twilioSession, "{\"event\":\"clear\",\"streamSid\":\"" + streamSid + "\"}");
+                            log.info("SEND->TWILIO clear streamSid={}", streamSid);
                         }
                         return;
                     }
 
                     if ("input_audio_buffer.speech_stopped".equals(type)) {
                         sendJson(ws, "{\"type\":\"input_audio_buffer.commit\"}");
+                        log.info("OPENAI sent input_audio_buffer.commit");
 
-                        // ✅ WICHTIG: modalities = ["audio","text"]
+                        // ✅ modalities = ["audio","text"]
                         sendJson(ws, "{\"type\":\"response.create\",\"response\":{\"modalities\":[\"audio\",\"text\"]}}");
+                        log.info("OPENAI sent response.create modalities=[audio,text]");
                         return;
                     }
 
                     if ("error".equals(type)) {
-                        log.error("OpenAI error: {}", text);
+                        log.error("OpenAI error raw={}", text);
                     }
 
                 } catch (Exception e) {
@@ -152,6 +164,10 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
             }
 
             private void sendAudioToTwilio(WebSocketSession session, String streamSid, String audioB64) {
+                // ===== C) Debug before sending audio to Twilio =====
+                log.info("SEND->TWILIO media streamSid={} payloadLen={}",
+                        streamSid, audioB64 != null ? audioB64.length() : -1);
+
                 String msg = "{\"event\":\"media\",\"streamSid\":\"" + streamSid + "\",\"media\":{\"payload\":\"" + audioB64 + "\"}}";
                 safeSend(session, msg);
             }
@@ -168,38 +184,56 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
         if (openaiWs == null) return;
 
         @SuppressWarnings("unchecked")
-        AtomicReference<String> streamSidRef = (AtomicReference<String>) twilioSession.getAttributes().get("streamSidRef");
+        AtomicReference<String> streamSidRef =
+                (AtomicReference<String>) twilioSession.getAttributes().get("streamSidRef");
+
         @SuppressWarnings("unchecked")
-        Queue<String> pendingAudio = (Queue<String>) twilioSession.getAttributes().get("pendingAudio");
+        Queue<String> pendingAudio =
+                (Queue<String>) twilioSession.getAttributes().get("pendingAudio");
 
         JsonNode n = M.readTree(message.getPayload());
         String event = n.path("event").asText();
 
+        // ===== A) Debug: Twilio event types =====
+        log.info("TWILIO event={}", event);
+
         if ("start".equals(event)) {
             String streamSid = n.path("start").path("streamSid").asText();
             streamSidRef.set(streamSid);
-            log.info("Twilio start streamSid={}", streamSid);
+            log.info("TWILIO start streamSid={}", streamSid);
 
+            // flush buffered audio
             String audio;
+            int flushed = 0;
             while ((audio = pendingAudio.poll()) != null) {
+                flushed++;
+                log.info("SEND->TWILIO buffered media streamSid={} payloadLen={}",
+                        streamSid, audio != null ? audio.length() : -1);
                 safeSend(twilioSession, "{\"event\":\"media\",\"streamSid\":\"" + streamSid + "\",\"media\":{\"payload\":\"" + audio + "\"}}");
             }
+            log.info("TWILIO start flushedBufferedAudio={}", flushed);
             return;
         }
 
         if ("media".equals(event)) {
             String payload = n.path("media").path("payload").asText();
+
+            // ===== A) Debug: Twilio media payload length =====
+            log.info("TWILIO media payloadLen={}", payload != null ? payload.length() : -1);
+
             openaiWs.send("{\"type\":\"input_audio_buffer.append\",\"audio\":\"" + payload + "\"}");
             return;
         }
 
         if ("stop".equals(event)) {
+            log.info("TWILIO stop received -> closing twilio session");
             try { twilioSession.close(); } catch (Exception ignored) {}
         }
     }
 
     @Override
     public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
+        log.info("Twilio WS closed status={}", status);
         Object ws = session.getAttributes().get("openaiWs");
         if (ws instanceof WebSocket ows) {
             try { ows.close(1000, "twilio closed"); } catch (Exception ignored) {}
