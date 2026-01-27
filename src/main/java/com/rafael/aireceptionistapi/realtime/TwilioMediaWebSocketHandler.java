@@ -39,7 +39,6 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
             return;
         }
 
-        // Twilio sendet "start" manchmal später -> Audio puffern bis streamSid da ist
         AtomicReference<String> streamSidRef = new AtomicReference<>(null);
         Queue<String> pendingAudio = new ConcurrentLinkedQueue<>();
 
@@ -55,7 +54,8 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
 
             @Override
             public void onOpen(WebSocket ws, Response resp) {
-                log.info("OpenAI WS OPEN status={} {}", resp.code(), resp.message());
+                // (1) OpenAI onOpen MUSS sichtbar sein
+                log.info("OPENAI onOpen CALLED. status={} msg={}", resp.code(), resp.message());
 
                 String instructions = """
                         Du bist eine echte Telefon-Rezeptionistin von „Viva la Mamma“.
@@ -85,7 +85,7 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
                 }
                 """.formatted(jsonString(instructions)));
 
-                // ✅ input_text statt text
+                // input_text (nicht "text")
                 sendJson(ws, """
                 {
                   "type":"conversation.item.create",
@@ -97,7 +97,7 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
                 }
                 """);
 
-                // ✅ modalities = ["audio","text"]
+                // modalities = ["audio","text"]
                 sendJson(ws, """
                 {"type":"response.create","response":{"modalities":["audio","text"]}}
                 """);
@@ -109,13 +109,10 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
                     JsonNode n = M.readTree(text);
                     String type = n.path("type").asText();
 
-                    // ===== B) Debug: OpenAI event types =====
                     log.info("OPENAI type={}", type);
 
                     if ("response.output_audio.delta".equals(type)) {
                         String audioB64 = n.path("delta").asText();
-
-                        // ===== B) Debug: audio delta length =====
                         log.info("OPENAI audio delta len={}", audioB64 != null ? audioB64.length() : -1);
 
                         String streamSid = streamSidRef.get();
@@ -142,7 +139,6 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
                         sendJson(ws, "{\"type\":\"input_audio_buffer.commit\"}");
                         log.info("OPENAI sent input_audio_buffer.commit");
 
-                        // ✅ modalities = ["audio","text"]
                         sendJson(ws, "{\"type\":\"response.create\",\"response\":{\"modalities\":[\"audio\",\"text\"]}}");
                         log.info("OPENAI sent response.create modalities=[audio,text]");
                         return;
@@ -158,13 +154,24 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
             }
 
             @Override
+            public void onClosing(WebSocket ws, int code, String reason) {
+                // (2) Sofortiges Close sichtbar machen
+                log.error("OPENAI onClosing code={} reason={}", code, reason);
+            }
+
+            @Override
+            public void onClosed(WebSocket ws, int code, String reason) {
+                // (3) Closed sichtbar machen
+                log.error("OPENAI onClosed code={} reason={}", code, reason);
+            }
+
+            @Override
             public void onFailure(WebSocket ws, Throwable t, Response resp) {
                 log.error("OpenAI WS FAILED: {} resp={}", t.getMessage(), resp != null ? resp.code() : "null");
                 try { twilioSession.close(CloseStatus.SERVER_ERROR); } catch (Exception ignored) {}
             }
 
             private void sendAudioToTwilio(WebSocketSession session, String streamSid, String audioB64) {
-                // ===== C) Debug before sending audio to Twilio =====
                 log.info("SEND->TWILIO media streamSid={} payloadLen={}",
                         streamSid, audioB64 != null ? audioB64.length() : -1);
 
@@ -194,7 +201,6 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
         JsonNode n = M.readTree(message.getPayload());
         String event = n.path("event").asText();
 
-        // ===== A) Debug: Twilio event types =====
         log.info("TWILIO event={}", event);
 
         if ("start".equals(event)) {
@@ -202,14 +208,15 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
             streamSidRef.set(streamSid);
             log.info("TWILIO start streamSid={}", streamSid);
 
-            // flush buffered audio
             String audio;
             int flushed = 0;
             while ((audio = pendingAudio.poll()) != null) {
                 flushed++;
                 log.info("SEND->TWILIO buffered media streamSid={} payloadLen={}",
                         streamSid, audio != null ? audio.length() : -1);
-                safeSend(twilioSession, "{\"event\":\"media\",\"streamSid\":\"" + streamSid + "\",\"media\":{\"payload\":\"" + audio + "\"}}");
+
+                safeSend(twilioSession,
+                        "{\"event\":\"media\",\"streamSid\":\"" + streamSid + "\",\"media\":{\"payload\":\"" + audio + "\"}}");
             }
             log.info("TWILIO start flushedBufferedAudio={}", flushed);
             return;
@@ -217,8 +224,6 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
 
         if ("media".equals(event)) {
             String payload = n.path("media").path("payload").asText();
-
-            // ===== A) Debug: Twilio media payload length =====
             log.info("TWILIO media payloadLen={}", payload != null ? payload.length() : -1);
 
             openaiWs.send("{\"type\":\"input_audio_buffer.append\",\"audio\":\"" + payload + "\"}");
@@ -240,8 +245,15 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
         }
     }
 
+    // (4) sendJson mit boolean check (OkHttp ws.send -> boolean)
     private static void sendJson(WebSocket ws, String json) {
-        ws.send(json);
+        boolean ok = ws.send(json);
+        if (!ok) {
+            String head = json.length() > 120 ? json.substring(0, 120) : json;
+            log.error("OPENAI ws.send returned FALSE (message not sent). First120={}", head);
+        } else {
+            log.info("OPENAI ws.send OK len={}", json.length());
+        }
     }
 
     private static String jsonString(String s) {
