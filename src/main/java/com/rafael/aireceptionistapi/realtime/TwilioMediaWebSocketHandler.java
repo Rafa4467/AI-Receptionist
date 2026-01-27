@@ -20,7 +20,6 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
     private static final Logger log = LoggerFactory.getLogger(TwilioMediaWebSocketHandler.class);
     private static final ObjectMapper M = new ObjectMapper();
 
-    // WS stabil halten
     private final OkHttpClient client = new OkHttpClient.Builder()
             .callTimeout(Duration.ZERO)
             .readTimeout(Duration.ZERO)
@@ -32,7 +31,7 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
     public void afterConnectionEstablished(WebSocketSession twilioSession) throws Exception {
 
         final String apiKey = System.getenv("OPENAI_API_KEY");
-        final String model = System.getenv().getOrDefault("OPENAI_REALTIME_MODEL", "gpt-realtime"); // oder gpt-realtime-mini
+        final String model = System.getenv().getOrDefault("OPENAI_REALTIME_MODEL", "gpt-realtime");
 
         if (apiKey == null || apiKey.isBlank()) {
             log.error("OPENAI_API_KEY fehlt -> Twilio Session wird geschlossen");
@@ -40,7 +39,6 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
             return;
         }
 
-        // Twilio sendet "start" manchmal später -> Audio puffern bis streamSid da ist
         AtomicReference<String> streamSidRef = new AtomicReference<>(null);
         Queue<String> pendingAudio = new ConcurrentLinkedQueue<>();
 
@@ -66,9 +64,6 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
                         Wenn du etwas nicht sicher weißt: sag das ehrlich und biete an zu verbinden.
                         """;
 
-                // Wichtig:
-                // - output_audio_format/input_audio_format passend für Twilio (G.711 µ-law)
-                // - interrupt_response: false => nicht “reingrätschen”
                 sendJson(ws, """
                 {
                   "type": "session.update",
@@ -84,25 +79,26 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
                       "prefix_padding_ms": 200,
                       "silence_duration_ms": 420
                     },
-                    "temperature": 0.25
+                    "temperature": 0.7
                   }
                 }
                 """.formatted(jsonString(instructions)));
 
-                // Start-Begrüßung sofort
+                // ✅ WICHTIG: input_text statt text
                 sendJson(ws, """
                 {
                   "type":"conversation.item.create",
                   "item":{
                     "type":"message",
                     "role":"user",
-                    "content":[{"type":"text","text":"Ciao und willkommen bei Viva la Mamma! Möchten Sie reservieren, etwas zum Menü wissen oder ist es etwas anderes?"}]
+                    "content":[{"type":"input_text","text":"Ciao und willkommen bei Viva la Mamma! Möchten Sie reservieren, etwas zum Menü wissen oder ist es etwas anderes?"}]
                   }
                 }
                 """);
 
+                // ✅ WICHTIG: modalities = ["audio","text"]
                 sendJson(ws, """
-                {"type":"response.create","response":{"modalities":["audio"]}}
+                {"type":"response.create","response":{"modalities":["audio","text"]}}
                 """);
             }
 
@@ -124,7 +120,6 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
                         return;
                     }
 
-                    // Wenn User spricht: Twilio Buffer leeren (aber NICHT OpenAI response.cancel spammen)
                     if ("input_audio_buffer.speech_started".equals(type)) {
                         String streamSid = streamSidRef.get();
                         if (streamSid != null) {
@@ -133,10 +128,11 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
                         return;
                     }
 
-                    // Wenn User fertig: commit + response.create (damit OpenAI sicher antwortet)
                     if ("input_audio_buffer.speech_stopped".equals(type)) {
                         sendJson(ws, "{\"type\":\"input_audio_buffer.commit\"}");
-                        sendJson(ws, "{\"type\":\"response.create\",\"response\":{\"modalities\":[\"audio\"]}}");
+
+                        // ✅ WICHTIG: modalities = ["audio","text"]
+                        sendJson(ws, "{\"type\":\"response.create\",\"response\":{\"modalities\":[\"audio\",\"text\"]}}");
                         return;
                     }
 
@@ -184,7 +180,6 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
             streamSidRef.set(streamSid);
             log.info("Twilio start streamSid={}", streamSid);
 
-            // flush buffered audio
             String audio;
             while ((audio = pendingAudio.poll()) != null) {
                 safeSend(twilioSession, "{\"event\":\"media\",\"streamSid\":\"" + streamSid + "\",\"media\":{\"payload\":\"" + audio + "\"}}");
