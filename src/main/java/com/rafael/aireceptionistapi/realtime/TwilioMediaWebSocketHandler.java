@@ -111,8 +111,9 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
 
                     log.info("OPENAI type={}", type);
 
-                    if ("response.output_audio.delta".equals(type)) {
+                    if ("response.audio.delta".equals(type) || "response.output_audio.delta".equals(type)) {
                         String audioB64 = n.path("delta").asText();
+
                         log.info("OPENAI audio delta len={}", audioB64 != null ? audioB64.length() : -1);
 
                         String streamSid = streamSidRef.get();
