@@ -146,9 +146,7 @@ Say exactly the following, word for word, without adding anything before or afte
 {
   "type":"response.create",
   "response":{
-    "conversation":"none",
-    "input":[],
-    "output_modalities":["audio","text"],
+    "modalities":["audio","text"],
     "instructions": %s
   }
 }
