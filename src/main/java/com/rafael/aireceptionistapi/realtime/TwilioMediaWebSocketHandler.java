@@ -126,8 +126,8 @@ Beende den Anruf immer warm und positiv:
                                "type": "server_vad",
                                "interrupt_response": false,
                                "threshold": 0.45,
-                               "prefix_padding_ms": 120,
-                               "silence_duration_ms": 250
+                               "prefix_padding_ms": 80,
+                               "silence_duration_ms": 180
                              },
                              "temperature": 0.8
                            }
@@ -136,20 +136,19 @@ Beende den Anruf immer warm und positiv:
 
                 // input_text (nicht "text")
                 sendJson(ws, """
-                {
-                  "type":"conversation.item.create",
-                  "item":{
-                    "type":"message",
-                    "role":"user",
-                    "content":[{"type":"input_text","text":"Ciao und willkommen bei Viva la Mamma! Möchten Sie reservieren, etwas zum Menü wissen oder ist es etwas anderes?"}]
-                  }
-                }
-                """);
+{
+  "type":"conversation.item.create",
+  "item":{
+    "type":"message",
+    "role":"assistant",
+    "content":[{"type":"output_text","text":"Herzlich willkommen bei Viva la Mamma. Möchten Sie eine Reservierung vornehmen oder darf ich Ihnen anderweitig helfen?"}]
+  }
+}
+""");
 
-                // modalities = ["audio","text"]
                 sendJson(ws, """
-                {"type":"response.create","response":{"modalities":["audio","text"]}}
-                """);
+{"type":"response.create","response":{"modalities":["audio","text"]}}
+""");
             }
 
             @Override
