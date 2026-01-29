@@ -124,6 +124,7 @@ Beende den Anruf immer warm und positiv:
                              "output_audio_format": "g711_ulaw",
                              "turn_detection": {
                                "type": "server_vad",
+                               "create_response": false,
                                "interrupt_response": false,
                                "threshold": 0.45,
                                "prefix_padding_ms": 80,
@@ -134,21 +135,25 @@ Beende den Anruf immer warm und positiv:
                          }
                 """.formatted(jsonString(instructions)));
 
-                // input_text (nicht "text")
-                sendJson(ws, """
-{
-  "type":"conversation.item.create",
-  "item":{
-    "type":"message",
-    "role":"assistant",
-    "content":[{"type":"output_text","text":"Herzlich willkommen bei Viva la Mamma. Möchten Sie eine Reservierung vornehmen oder darf ich Ihnen anderweitig helfen?"}]
-  }
-}
-""");
+                String greet = "Guten Tag und herzlich willkommen bei Viva la Mamma. Möchten Sie eine Reservierung vornehmen oder haben Sie eine andere Frage?";
+
+                String prompt = """
+Say exactly the following, word for word, without adding anything before or after:
+%s
+""".formatted(greet);
 
                 sendJson(ws, """
-{"type":"response.create","response":{"modalities":["audio","text"]}}
-""");
+{
+  "type":"response.create",
+  "response":{
+    "conversation":"none",
+    "input":[],
+    "output_modalities":["audio","text"],
+    "instructions": %s
+  }
+}
+""".formatted(jsonString(prompt)));
+
             }
 
             @Override
