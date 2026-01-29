@@ -12,6 +12,7 @@ import org.springframework.web.socket.handler.TextWebSocketHandler;
 import java.time.Duration;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 @Component
@@ -42,6 +43,9 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
         AtomicReference<String> streamSidRef = new AtomicReference<>(null);
         Queue<String> pendingAudio = new ConcurrentLinkedQueue<>();
 
+        // Barge-in state (damit wir “nachlaufende” deltas nach cancel droppen können)
+        AtomicBoolean assistantSpeaking = new AtomicBoolean(false);
+
         Request req = new Request.Builder()
                 .url("wss://api.openai.com/v1/realtime?model=" + model)
                 .addHeader("Authorization", "Bearer " + apiKey)
@@ -54,7 +58,6 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
 
             @Override
             public void onOpen(WebSocket ws, Response resp) {
-                // (1) OpenAI onOpen MUSS sichtbar sein
                 log.info("OPENAI onOpen CALLED. status={} msg={}", resp.code(), resp.message());
 
                 String instructions = """
@@ -94,64 +97,49 @@ Regeln:
 - Wenn der Gast “heute”/“morgen” sagt: frage zur Sicherheit nach dem Wochentag oder wiederhole das Datum verbal.
 
 BESTÄTIGUNG
-Wenn du alle 5 Punkte hast, bestätige alles in 1–2 Sätzen:
-- „Perfekt, ich habe eine Reservierung für {Personen} Personen am {Datum} um {Uhrzeit} auf den Namen {Name}. Telefonnummer {Telefon}.“
-Dann frage am Ende:
-- „Passt das so für Sie?“
-
-SONDERWÜNSCHE
-Wenn sinnvoll (aber erst nach den 5 Pflichtpunkten):
-- „Gibt es Allergien oder einen besonderen Wunsch (z.B. Kinderstuhl)?“
-Wenn ja: kurz bestätigen.
-
-MENÜ / FRAGEN
-Wenn der Gast kein Reservierungsthema hat:
-- Frag kurz, was er braucht („Worum geht’s genau – Reservierung oder eine Frage zum Menü?“)
-- Antworte kurz, hilfreich, freundlich.
+Wenn du alle 5 Punkte hast, bestätige alles in 1–2 Sätzen und frage: „Passt das so für Sie?“
 
 ABSCHLUSS
-Beende den Anruf immer warm und positiv:
-- „Super, dann freuen wir uns auf Sie. Danke fürs Anrufen und bis bald bei Viva la Mamma!“
+Beende den Anruf warm und positiv.
 """;
 
+                // Session Update (mit Barge-in)
                 sendJson(ws, """
-                        {
-                           "type": "session.update",
-                           "session": {
-                             "instructions": "...DEIN TEXT + die 3 Nova-Linien...",
-                             "voice": "coral",
-                             "input_audio_format": "g711_ulaw",
-                             "output_audio_format": "g711_ulaw",
-                             "turn_detection": {
-                               "type": "server_vad",
-                               "create_response": false,
-                               "interrupt_response": false,
-                               "threshold": 0.45,
-                               "prefix_padding_ms": 80,
-                               "silence_duration_ms": 180
-                             },
-                             "temperature": 0.8
-                           }
-                         }
+                {
+                  "type": "session.update",
+                  "session": {
+                    "instructions": %s,
+                    "voice": "coral",
+                    "input_audio_format": "g711_ulaw",
+                    "output_audio_format": "g711_ulaw",
+                    "turn_detection": {
+                      "type": "server_vad",
+                      "interrupt_response": true,
+                      "threshold": 0.45,
+                      "prefix_padding_ms": 80,
+                      "silence_duration_ms": 180
+                    },
+                    "temperature": 0.8
+                  }
+                }
                 """.formatted(jsonString(instructions)));
 
+                // Fixe Begrüßung “word for word”
                 String greet = "Guten Tag und herzlich willkommen bei Viva la Mamma. Möchten Sie eine Reservierung vornehmen oder haben Sie eine andere Frage?";
-
                 String prompt = """
 Say exactly the following, word for word, without adding anything before or after:
 %s
 """.formatted(greet);
 
                 sendJson(ws, """
-{
-  "type":"response.create",
-  "response":{
-    "modalities":["audio","text"],
-    "instructions": %s
-  }
-}
-""".formatted(jsonString(prompt)));
-
+                {
+                  "type":"response.create",
+                  "response":{
+                    "modalities":["audio","text"],
+                    "instructions": %s
+                  }
+                }
+                """.formatted(jsonString(prompt)));
             }
 
             @Override
@@ -162,10 +150,15 @@ Say exactly the following, word for word, without adding anything before or afte
 
                     log.info("OPENAI type={}", type);
 
+                    // AUDIO DELTAS (dein Model sendet response.audio.delta)
                     if ("response.audio.delta".equals(type) || "response.output_audio.delta".equals(type)) {
                         String audioB64 = n.path("delta").asText();
 
-                        log.info("OPENAI audio delta len={}", audioB64 != null ? audioB64.length() : -1);
+                        // Wenn wir gerade gecancelt haben, können “late deltas” reintröpfeln -> droppen
+                        if (!assistantSpeaking.get()) {
+                            // Wir setzen speaking erst beim ersten delta (damit wir late-delta drop sauber haben)
+                            assistantSpeaking.set(true);
+                        }
 
                         String streamSid = streamSidRef.get();
                         if (streamSid == null) {
@@ -178,15 +171,30 @@ Say exactly the following, word for word, without adding anything before or afte
                         return;
                     }
 
+                    // DONE EVENTS -> assistantSpeaking false
+                    if ("response.audio.done".equals(type) || "response.done".equals(type)) {
+                        assistantSpeaking.set(false);
+                        log.info("OPENAI response done -> assistantSpeaking=false");
+                        return;
+                    }
+
+                    // BARGE-IN: User startet zu sprechen -> Twilio clear + OpenAI response.cancel
                     if ("input_audio_buffer.speech_started".equals(type)) {
                         String streamSid = streamSidRef.get();
                         if (streamSid != null) {
                             safeSend(twilioSession, "{\"event\":\"clear\",\"streamSid\":\"" + streamSid + "\"}");
                             log.info("SEND->TWILIO clear streamSid={}", streamSid);
                         }
+
+                        // WICHTIG: OpenAI wirklich stoppen
+                        boolean ok = ws.send("{\"type\":\"response.cancel\"}");
+                        assistantSpeaking.set(false); // ab hier deltas droppen (falls nachlaufen)
+
+                        log.info("BARGE-IN: sent response.cancel ok={}", ok);
                         return;
                     }
 
+                    // Wenn User fertig: commit + response.create
                     if ("input_audio_buffer.speech_stopped".equals(type)) {
                         sendJson(ws, "{\"type\":\"input_audio_buffer.commit\"}");
                         log.info("OPENAI sent input_audio_buffer.commit");
@@ -207,13 +215,11 @@ Say exactly the following, word for word, without adding anything before or afte
 
             @Override
             public void onClosing(WebSocket ws, int code, String reason) {
-                // (2) Sofortiges Close sichtbar machen
                 log.error("OPENAI onClosing code={} reason={}", code, reason);
             }
 
             @Override
             public void onClosed(WebSocket ws, int code, String reason) {
-                // (3) Closed sichtbar machen
                 log.error("OPENAI onClosed code={} reason={}", code, reason);
             }
 
@@ -224,6 +230,9 @@ Say exactly the following, word for word, without adding anything before or afte
             }
 
             private void sendAudioToTwilio(WebSocketSession session, String streamSid, String audioB64) {
+                // Wenn wir gecancelt haben und assistantSpeaking=false, droppe deltas (z.B. nach cancel)
+                if (!assistantSpeaking.get()) return;
+
                 log.info("SEND->TWILIO media streamSid={} payloadLen={}",
                         streamSid, audioB64 != null ? audioB64.length() : -1);
 
@@ -260,13 +269,11 @@ Say exactly the following, word for word, without adding anything before or afte
             streamSidRef.set(streamSid);
             log.info("TWILIO start streamSid={}", streamSid);
 
+            // flush buffered audio
             String audio;
             int flushed = 0;
             while ((audio = pendingAudio.poll()) != null) {
                 flushed++;
-                log.info("SEND->TWILIO buffered media streamSid={} payloadLen={}",
-                        streamSid, audio != null ? audio.length() : -1);
-
                 safeSend(twilioSession,
                         "{\"event\":\"media\",\"streamSid\":\"" + streamSid + "\",\"media\":{\"payload\":\"" + audio + "\"}}");
             }
@@ -297,7 +304,7 @@ Say exactly the following, word for word, without adding anything before or afte
         }
     }
 
-    // (4) sendJson mit boolean check (OkHttp ws.send -> boolean)
+    // OkHttp ws.send -> boolean
     private static void sendJson(WebSocket ws, String json) {
         boolean ok = ws.send(json);
         if (!ok) {
@@ -309,7 +316,9 @@ Say exactly the following, word for word, without adding anything before or afte
     }
 
     private static String jsonString(String s) {
-        return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") + "\"";
+        return "\"" + s.replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n") + "\"";
     }
 
     private static void safeSend(WebSocketSession session, String payload) {
