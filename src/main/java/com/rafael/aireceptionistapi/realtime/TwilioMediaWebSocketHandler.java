@@ -10,9 +10,10 @@ import org.springframework.web.socket.*;
 import org.springframework.web.socket.handler.TextWebSocketHandler;
 
 import java.time.Duration;
+import java.util.Map;
 import java.util.Queue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 @Component
@@ -43,8 +44,9 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
         AtomicReference<String> streamSidRef = new AtomicReference<>(null);
         Queue<String> pendingAudio = new ConcurrentLinkedQueue<>();
 
-        // Barge-in state (damit wir “nachlaufende” deltas nach cancel droppen können)
-        AtomicBoolean assistantSpeaking = new AtomicBoolean(false);
+        // Tool-call state
+        Map<String, String> callIdToName = new ConcurrentHashMap<>();
+        Map<String, StringBuilder> callIdToArgsBuf = new ConcurrentHashMap<>();
 
         Request req = new Request.Builder()
                 .url("wss://api.openai.com/v1/realtime?model=" + model)
@@ -63,52 +65,42 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
                 String instructions = """
 Du bist die Telefon-Rezeptionistin von „Viva la Mamma“.
 Du sprichst ausschließlich Deutsch (de-DE) und klingst jung, klar weiblich, warm und freundlich – als würdest du beim Sprechen leicht lächeln.
-Deine Art ist positiv, aufmerksam, serviceorientiert und lebendig, aber nie hektisch oder laut. Du klingst „echt“ wie am Telefon.
-WICHTIG: Nach jedem Schritt nur neutral wiederholen (ohne Lob/Wertung).
-Verwende NICHT: „super“, „perfekt“, „toll“, „sehr gut“.
-Stattdessen nur: „Alles klar,“ oder „Okay,“ + Wiederholung + nächste Frage.
-Bestätige pro Schritt maximal EINMAL.
-Erst ganz am Ende (nach allen 5 Punkten) frage: „Passt das so?“
+Kurze, klare Sätze. Keine langen Monologe.
 
-STIMME & TON
-- Warm, freundlich, leicht begeistert („freut mich!“), mit natürlicher Energie.
-- Kurze, klare Sätze. Keine langen Monologe.
-- Kling menschlich: kleine Bestätigungen („okay“, „alles klar“, „perfekt“), aber nicht zu oft.
-- Wenn der Gast unsicher ist: ruhig führen, freundlich nachfragen.
-- Keine Emojis, keine Aufzählungen am Telefon vorlesen.
-
-TELEFON-REALISMUS
-- Handle wie ein echter Anruf: reagiere schnell, natürlich, ohne künstliche „KI“-Erklärungen.
-- Wenn du etwas nicht verstanden hast: bitte um Wiederholung, kurz und höflich.
-- Wenn Hintergrundlärm/undeutlich: „Ich hab Sie gerade nicht ganz verstanden – könnten Sie das bitte kurz wiederholen?“
-- Wenn der Gast gleichzeitig spricht: bleib ruhig, lass ihn ausreden, dann kurz zusammenfassen.
-
-HAUPTZIEL
-Du hilfst bei Reservierungen, Fragen zum Restaurant, Öffnungszeiten, Adresse/Anfahrt, Allergien/Sonderwünschen.
-Wenn etwas außerhalb deiner Infos liegt: sag ehrlich, dass du es nicht sicher weißt, und biete an, kurz nachzufragen/zu verbinden.
+WICHTIG: Wenn der Gast ein relatives Datum sagt (z.B. „nächsten Dienstag“, „kommenden Freitag“, „übermorgen“),
+dann rufe IMMER das Tool `resolve_relative_date` auf, bevor du nachfragst oder bestätigst.
+Nenne danach das konkrete Datum kurz (z.B. „Dienstag, 03.02.2026“), dann erst weiter im Reservierungs-Schema.
 
 RESERVIERUNGEN – IMMER Schritt für Schritt (genau diese Reihenfolge)
-Wenn der Gast reservieren möchte, frage IMMER nacheinander:
 1) Personenanzahl
 2) Datum
 3) Uhrzeit
-4) Name (Vor- und Nachname, falls möglich)
-5) Telefonnummer (für Rückfragen)
+4) Name
+5) Telefonnummer
 
 Regeln:
-- Stelle pro Schritt nur eine klare Frage.
-- Wiederhole nach jedem Schritt kurz das Gehörte („Okay, für 4 Personen.“).
-- Wenn Datum/Uhrzeit unklar: stelle 1–2 kurze Rückfragen.
-- Wenn der Gast “heute”/“morgen” sagt: frage zur Sicherheit nach dem Wochentag oder wiederhole das Datum verbal.
-
-BESTÄTIGUNG
-Wenn du alle 5 Punkte hast, bestätige alles in 1–2 Sätzen und frage: „Passt das so für Sie?“
-
-ABSCHLUSS
-Beende den Anruf warm und positiv.
+- Pro Schritt nur 1 Frage.
+- Bestätige knapp das Gehörte, aber NICHT übertrieben („Okay“ reicht).
+- Sage NICHT „super/perfekt“, bevor der Schritt wirklich fertig ist.
 """;
 
-                // Session Update (mit Barge-in)
+                // Tool definition (Function Calling)
+                String toolsJson = """
+                [{
+                  "type":"function",
+                  "name":"resolve_relative_date",
+                  "description":"Löst deutsche relative Datumsangaben (z.B. nächster Dienstag, morgen, übermorgen) in ein konkretes Datum in Europe/Vienna auf.",
+                  "parameters":{
+                    "type":"object",
+                    "properties":{
+                      "phrase":{"type":"string","description":"Originalphrase des Gastes, z.B. 'nächsten Dienstag'."}
+                    },
+                    "required":["phrase"]
+                  }
+                }]
+                """;
+
+                // session.update with tools
                 sendJson(ws, """
                 {
                   "type": "session.update",
@@ -117,20 +109,24 @@ Beende den Anruf warm und positiv.
                     "voice": "coral",
                     "input_audio_format": "g711_ulaw",
                     "output_audio_format": "g711_ulaw",
+                    "tools": %s,
+                    "tool_choice": "auto",
                     "turn_detection": {
                       "type": "server_vad",
+                      "create_response": false,
                       "interrupt_response": true,
-                      "threshold": 0.40,
-                      "prefix_padding_ms": 120,
-                      "silence_duration_ms": 320
+                      "threshold": 0.45,
+                      "prefix_padding_ms": 80,
+                      "silence_duration_ms": 180
                     },
-                    "temperature": 0.8
+                    "temperature": 0.7
                   }
                 }
-                """.formatted(jsonString(instructions)));
+                """.formatted(jsonString(instructions), toolsJson));
 
-                // Fixe Begrüßung “word for word”
+                // Begrüßung (fix, word-for-word)
                 String greet = "Guten Tag und herzlich willkommen bei Viva la Mamma. Möchten Sie eine Reservierung vornehmen oder haben Sie eine andere Frage?";
+
                 String prompt = """
 Say exactly the following, word for word, without adding anything before or after:
 %s
@@ -152,18 +148,82 @@ Say exactly the following, word for word, without adding anything before or afte
                 try {
                     JsonNode n = M.readTree(text);
                     String type = n.path("type").asText();
-
                     log.info("OPENAI type={}", type);
 
-                    // AUDIO DELTAS (dein Model sendet response.audio.delta)
+                    // 1) Tool call item appears as an output item
+                    if ("response.output_item.added".equals(type) || "response.output_item.done".equals(type)) {
+                        JsonNode item = n.path("item");
+                        String itemType = item.path("type").asText();
+                        if ("function_call".equals(itemType)) {
+                            String callId = item.path("call_id").asText();
+                            String name = item.path("name").asText();
+                            if (callId != null && !callId.isBlank()) {
+                                callIdToName.put(callId, name);
+                                callIdToArgsBuf.putIfAbsent(callId, new StringBuilder());
+                                log.info("TOOL CALL detected name={} call_id={}", name, callId);
+                            }
+                        }
+                        // keep going
+                    }
+
+                    // 2) Tool arguments stream in deltas
+                    if ("response.function_call_arguments.delta".equals(type)) {
+                        String callId = n.path("call_id").asText();
+                        String delta = n.path("delta").asText("");
+                        callIdToArgsBuf.computeIfAbsent(callId, k -> new StringBuilder()).append(delta);
+                        log.info("TOOL args delta call_id={} len={}", callId, delta.length());
+                        return;
+                    }
+
+                    // 3) Tool arguments done -> execute backend function, send function_call_output, then response.create
+                    if ("response.function_call_arguments.done".equals(type)) {
+                        String callId = n.path("call_id").asText();
+                        String argsStr = n.path("arguments").asText(null);
+
+                        if ((argsStr == null || argsStr.isBlank()) && callIdToArgsBuf.containsKey(callId)) {
+                            argsStr = callIdToArgsBuf.get(callId).toString();
+                        }
+
+                        String toolName = callIdToName.getOrDefault(callId, "unknown");
+                        log.info("TOOL args done name={} call_id={} args={}", toolName, callId, argsStr);
+
+                        String output = "{\"ok\":false,\"note\":\"unknown tool\"}";
+                        if ("resolve_relative_date".equals(toolName)) {
+                            String phrase = "";
+                            try {
+                                JsonNode args = M.readTree(argsStr);
+                                phrase = args.path("phrase").asText("");
+                            } catch (Exception ignored) {}
+                            output = DateResolver.resolveGermanRelativeDate(phrase);
+                        }
+
+                        // Send function_call_output item back to OpenAI
+                        sendJson(ws, """
+                        {
+                          "type":"conversation.item.create",
+                          "item":{
+                            "type":"function_call_output",
+                            "call_id": %s,
+                            "output": %s
+                          }
+                        }
+                        """.formatted(jsonString(callId), jsonString(output)));
+
+                        // Trigger model to continue speaking based on tool output
+                        sendJson(ws, """
+                        {
+                          "type":"response.create",
+                          "response":{"modalities":["audio","text"]}
+                        }
+                        """);
+
+                        return;
+                    }
+
+                    // Audio to Twilio
                     if ("response.audio.delta".equals(type) || "response.output_audio.delta".equals(type)) {
                         String audioB64 = n.path("delta").asText();
-
-                        // Wenn wir gerade gecancelt haben, können “late deltas” reintröpfeln -> droppen
-                        if (!assistantSpeaking.get()) {
-                            // Wir setzen speaking erst beim ersten delta (damit wir late-delta drop sauber haben)
-                            assistantSpeaking.set(true);
-                        }
+                        log.info("OPENAI audio delta len={}", audioB64 != null ? audioB64.length() : -1);
 
                         String streamSid = streamSidRef.get();
                         if (streamSid == null) {
@@ -171,35 +231,19 @@ Say exactly the following, word for word, without adding anything before or afte
                             log.info("OPENAI audio buffered (no streamSid yet) bufferedCount~{}", pendingAudio.size());
                             return;
                         }
-
                         sendAudioToTwilio(twilioSession, streamSid, audioB64);
                         return;
                     }
 
-                    // DONE EVENTS -> assistantSpeaking false
-                    if ("response.audio.done".equals(type) || "response.done".equals(type)) {
-                        assistantSpeaking.set(false);
-                        log.info("OPENAI response done -> assistantSpeaking=false");
-                        return;
-                    }
-
-                    // BARGE-IN: User startet zu sprechen -> Twilio clear + OpenAI response.cancel
                     if ("input_audio_buffer.speech_started".equals(type)) {
                         String streamSid = streamSidRef.get();
                         if (streamSid != null) {
                             safeSend(twilioSession, "{\"event\":\"clear\",\"streamSid\":\"" + streamSid + "\"}");
                             log.info("SEND->TWILIO clear streamSid={}", streamSid);
                         }
-
-                        // WICHTIG: OpenAI wirklich stoppen
-                        boolean ok = ws.send("{\"type\":\"response.cancel\"}");
-                        assistantSpeaking.set(false); // ab hier deltas droppen (falls nachlaufen)
-
-                        log.info("BARGE-IN: sent response.cancel ok={}", ok);
                         return;
                     }
 
-                    // Wenn User fertig: commit + response.create
                     if ("input_audio_buffer.speech_stopped".equals(type)) {
                         sendJson(ws, "{\"type\":\"input_audio_buffer.commit\"}");
                         log.info("OPENAI sent input_audio_buffer.commit");
@@ -235,9 +279,6 @@ Say exactly the following, word for word, without adding anything before or afte
             }
 
             private void sendAudioToTwilio(WebSocketSession session, String streamSid, String audioB64) {
-                // Wenn wir gecancelt haben und assistantSpeaking=false, droppe deltas (z.B. nach cancel)
-                if (!assistantSpeaking.get()) return;
-
                 log.info("SEND->TWILIO media streamSid={} payloadLen={}",
                         streamSid, audioB64 != null ? audioB64.length() : -1);
 
@@ -274,11 +315,13 @@ Say exactly the following, word for word, without adding anything before or afte
             streamSidRef.set(streamSid);
             log.info("TWILIO start streamSid={}", streamSid);
 
-            // flush buffered audio
             String audio;
             int flushed = 0;
             while ((audio = pendingAudio.poll()) != null) {
                 flushed++;
+                log.info("SEND->TWILIO buffered media streamSid={} payloadLen={}",
+                        streamSid, audio != null ? audio.length() : -1);
+
                 safeSend(twilioSession,
                         "{\"event\":\"media\",\"streamSid\":\"" + streamSid + "\",\"media\":{\"payload\":\"" + audio + "\"}}");
             }
@@ -309,7 +352,6 @@ Say exactly the following, word for word, without adding anything before or afte
         }
     }
 
-    // OkHttp ws.send -> boolean
     private static void sendJson(WebSocket ws, String json) {
         boolean ok = ws.send(json);
         if (!ok) {
@@ -321,9 +363,7 @@ Say exactly the following, word for word, without adding anything before or afte
     }
 
     private static String jsonString(String s) {
-        return "\"" + s.replace("\\", "\\\\")
-                .replace("\"", "\\\"")
-                .replace("\n", "\\n") + "\"";
+        return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") + "\"";
     }
 
     private static void safeSend(WebSocketSession session, String payload) {
