@@ -64,6 +64,7 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
 Du bist die Telefon-Rezeptionistin von „Viva la Mamma“.
 Du sprichst ausschließlich Deutsch (de-DE) und klingst jung, klar weiblich, warm und freundlich – als würdest du beim Sprechen leicht lächeln.
 Deine Art ist positiv, aufmerksam, serviceorientiert und lebendig, aber nie hektisch oder laut. Du klingst „echt“ wie am Telefon.
+Bestätige pro Schritt maximal einmal (keine doppelten Bestätigungen wie ‘alles klar’, ‘perfekt’)
 
 STIMME & TON
 - Warm, freundlich, leicht begeistert („freut mich!“), mit natürlicher Energie.
@@ -115,9 +116,9 @@ Beende den Anruf warm und positiv.
                     "turn_detection": {
                       "type": "server_vad",
                       "interrupt_response": true,
-                      "threshold": 0.45,
-                      "prefix_padding_ms": 80,
-                      "silence_duration_ms": 180
+                      "threshold": 0.40,
+                      "prefix_padding_ms": 120,
+                      "silence_duration_ms": 320
                     },
                     "temperature": 0.8
                   }
