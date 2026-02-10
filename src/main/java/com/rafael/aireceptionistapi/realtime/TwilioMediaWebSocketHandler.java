@@ -14,6 +14,8 @@ import java.util.Map;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 @Component
@@ -41,10 +43,20 @@ public class TwilioMediaWebSocketHandler extends TextWebSocketHandler {
             return;
         }
 
+        // Phone capture mode
+        AtomicReference<Boolean> phoneCaptureMode = new AtomicReference<>(false);
+        AtomicLong phoneModeUntilMs = new AtomicLong(0);
+        twilioSession.getAttributes().put("phoneCaptureMode", phoneCaptureMode);
+        twilioSession.getAttributes().put("phoneModeUntilMs", phoneModeUntilMs);
+
+        // If we cancel a response, late audio deltas can still arrive -> drop them
+        AtomicBoolean assistantSpeaking = new AtomicBoolean(false);
+        twilioSession.getAttributes().put("assistantSpeaking", assistantSpeaking);
+
         AtomicReference<String> streamSidRef = new AtomicReference<>(null);
         Queue<String> pendingAudio = new ConcurrentLinkedQueue<>();
 
-        // Tool-call state
+        // Tool-call state (for *all* tools)
         Map<String, String> callIdToName = new ConcurrentHashMap<>();
         Map<String, StringBuilder> callIdToArgsBuf = new ConcurrentHashMap<>();
 
@@ -78,29 +90,58 @@ RESERVIERUNGEN – IMMER Schritt für Schritt (genau diese Reihenfolge)
 4) Name
 5) Telefonnummer
 
+TELEFONNUMMER (sehr wichtig)
+- Bevor du nach der Telefonnummer fragst, rufe IMMER das Tool `enter_phone_mode` auf.
+- Bitte den Gast dann: „Nennen Sie die Nummer bitte langsam in Zweiergruppen. Ich wiederhole sie anschließend.“
+- Während der Gast die Nummer sagt, NICHT sprechen.
+- Nachdem du die Nummer verstanden hast, rufe IMMER `exit_phone_mode` auf.
+- Wiederhole die Nummer in Zweiergruppen und frage: „Stimmt das so?“
+- Wenn eine Ziffer unklar ist: bitte nur den betroffenen Teil nochmal.
+
 Regeln:
 - Pro Schritt nur 1 Frage.
 - Bestätige knapp das Gehörte, aber NICHT übertrieben („Okay“ reicht).
 - Sage NICHT „super/perfekt“, bevor der Schritt wirklich fertig ist.
 """;
 
-                // Tool definition (Function Calling)
+                // Tools: resolve_relative_date + phone mode tools
                 String toolsJson = """
-                [{
-                  "type":"function",
-                  "name":"resolve_relative_date",
-                  "description":"Löst deutsche relative Datumsangaben (z.B. nächster Dienstag, morgen, übermorgen) in ein konkretes Datum in Europe/Vienna auf.",
-                  "parameters":{
-                    "type":"object",
-                    "properties":{
-                      "phrase":{"type":"string","description":"Originalphrase des Gastes, z.B. 'nächsten Dienstag'."}
-                    },
-                    "required":["phrase"]
+                [
+                  {
+                    "type":"function",
+                    "name":"resolve_relative_date",
+                    "description":"Löst deutsche relative Datumsangaben (z.B. nächster Dienstag, morgen, übermorgen) in ein konkretes Datum in Europe/Vienna auf.",
+                    "parameters":{
+                      "type":"object",
+                      "properties":{
+                        "phrase":{"type":"string","description":"Originalphrase des Gastes, z.B. 'nächsten Dienstag'."}
+                      },
+                      "required":["phrase"]
+                    }
+                  },
+                  {
+                    "type":"function",
+                    "name":"enter_phone_mode",
+                    "description":"Aktiviert einen Modus, in dem der Assistent NICHT zwischen einzelne Ziffern reinredet. Sollte direkt vor dem Abfragen der Telefonnummer aufgerufen werden.",
+                    "parameters":{
+                      "type":"object",
+                      "properties":{
+                        "timeout_ms":{"type":"integer","description":"Wie lange Phone-Mode maximal aktiv bleiben soll (Fallback). Default 15000."}
+                      }
+                    }
+                  },
+                  {
+                    "type":"function",
+                    "name":"exit_phone_mode",
+                    "description":"Deaktiviert Phone-Mode. Sollte aufgerufen werden, sobald die Telefonnummer erfasst ist.",
+                    "parameters":{
+                      "type":"object",
+                      "properties":{}
+                    }
                   }
-                }]
+                ]
                 """;
 
-                // session.update with tools
                 sendJson(ws, """
                 {
                   "type": "session.update",
@@ -117,14 +158,13 @@ Regeln:
                       "interrupt_response": true,
                       "threshold": 0.45,
                       "prefix_padding_ms": 80,
-                      "silence_duration_ms": 180
+                      "silence_duration_ms": 320
                     },
                     "temperature": 0.7
                   }
                 }
                 """.formatted(jsonString(instructions), toolsJson));
 
-                // Begrüßung (fix, word-for-word)
                 String greet = "Guten Tag und herzlich willkommen bei Viva la Mamma. Möchten Sie eine Reservierung vornehmen oder haben Sie eine andere Frage?";
 
                 String prompt = """
@@ -150,7 +190,7 @@ Say exactly the following, word for word, without adding anything before or afte
                     String type = n.path("type").asText();
                     log.info("OPENAI type={}", type);
 
-                    // 1) Tool call item appears as an output item
+                    // Tool call item appears as output item
                     if ("response.output_item.added".equals(type) || "response.output_item.done".equals(type)) {
                         JsonNode item = n.path("item");
                         String itemType = item.path("type").asText();
@@ -163,10 +203,9 @@ Say exactly the following, word for word, without adding anything before or afte
                                 log.info("TOOL CALL detected name={} call_id={}", name, callId);
                             }
                         }
-                        // keep going
                     }
 
-                    // 2) Tool arguments stream in deltas
+                    // Tool args deltas
                     if ("response.function_call_arguments.delta".equals(type)) {
                         String callId = n.path("call_id").asText();
                         String delta = n.path("delta").asText("");
@@ -175,7 +214,7 @@ Say exactly the following, word for word, without adding anything before or afte
                         return;
                     }
 
-                    // 3) Tool arguments done -> execute backend function, send function_call_output, then response.create
+                    // Tool args done -> execute & return function_call_output
                     if ("response.function_call_arguments.done".equals(type)) {
                         String callId = n.path("call_id").asText();
                         String argsStr = n.path("arguments").asText(null);
@@ -188,16 +227,34 @@ Say exactly the following, word for word, without adding anything before or afte
                         log.info("TOOL args done name={} call_id={} args={}", toolName, callId, argsStr);
 
                         String output = "{\"ok\":false,\"note\":\"unknown tool\"}";
+
                         if ("resolve_relative_date".equals(toolName)) {
                             String phrase = "";
-                            try {
-                                JsonNode args = M.readTree(argsStr);
-                                phrase = args.path("phrase").asText("");
-                            } catch (Exception ignored) {}
+                            try { phrase = M.readTree(argsStr).path("phrase").asText(""); } catch (Exception ignored) {}
                             output = DateResolver.resolveGermanRelativeDate(phrase);
                         }
 
-                        // Send function_call_output item back to OpenAI
+                        if ("enter_phone_mode".equals(toolName)) {
+                            long now = System.currentTimeMillis();
+                            long timeout = 15000;
+                            try {
+                                JsonNode args = (argsStr == null || argsStr.isBlank()) ? null : M.readTree(argsStr);
+                                if (args != null && args.has("timeout_ms")) timeout = Math.max(5000, args.get("timeout_ms").asLong());
+                            } catch (Exception ignored) {}
+
+                            phoneCaptureMode.set(true);
+                            phoneModeUntilMs.set(now + timeout);
+                            output = "{\"ok\":true,\"phoneMode\":true,\"timeout_ms\":" + timeout + "}";
+                            log.info("PHONE MODE -> ON for {} ms (until={})", timeout, phoneModeUntilMs.get());
+                        }
+
+                        if ("exit_phone_mode".equals(toolName)) {
+                            phoneCaptureMode.set(false);
+                            phoneModeUntilMs.set(0);
+                            output = "{\"ok\":true,\"phoneMode\":false}";
+                            log.info("PHONE MODE -> OFF");
+                        }
+
                         sendJson(ws, """
                         {
                           "type":"conversation.item.create",
@@ -209,7 +266,7 @@ Say exactly the following, word for word, without adding anything before or afte
                         }
                         """.formatted(jsonString(callId), jsonString(output)));
 
-                        // Trigger model to continue speaking based on tool output
+                        // continue response after tool output
                         sendJson(ws, """
                         {
                           "type":"response.create",
@@ -222,34 +279,52 @@ Say exactly the following, word for word, without adding anything before or afte
 
                     // Audio to Twilio
                     if ("response.audio.delta".equals(type) || "response.output_audio.delta".equals(type)) {
-                        String audioB64 = n.path("delta").asText();
-                        log.info("OPENAI audio delta len={}", audioB64 != null ? audioB64.length() : -1);
+                        assistantSpeaking.set(true);
 
+                        String audioB64 = n.path("delta").asText();
                         String streamSid = streamSidRef.get();
+
                         if (streamSid == null) {
                             pendingAudio.add(audioB64);
-                            log.info("OPENAI audio buffered (no streamSid yet) bufferedCount~{}", pendingAudio.size());
                             return;
                         }
+
                         sendAudioToTwilio(twilioSession, streamSid, audioB64);
                         return;
                     }
 
+                    if ("response.done".equals(type) || "response.audio.done".equals(type)) {
+                        assistantSpeaking.set(false);
+                        return;
+                    }
+
+                    // Barge-in: user starts speaking -> clear Twilio + cancel OpenAI response
                     if ("input_audio_buffer.speech_started".equals(type)) {
                         String streamSid = streamSidRef.get();
                         if (streamSid != null) {
                             safeSend(twilioSession, "{\"event\":\"clear\",\"streamSid\":\"" + streamSid + "\"}");
-                            log.info("SEND->TWILIO clear streamSid={}", streamSid);
                         }
+
+                        boolean ok = ws.send("{\"type\":\"response.cancel\"}");
+                        assistantSpeaking.set(false);
+                        log.info("BARGE-IN: sent response.cancel ok={}", ok);
                         return;
                     }
 
+                    // speech_stopped: commit always. create_response only if NOT in phone mode window
                     if ("input_audio_buffer.speech_stopped".equals(type)) {
                         sendJson(ws, "{\"type\":\"input_audio_buffer.commit\"}");
-                        log.info("OPENAI sent input_audio_buffer.commit");
+
+                        boolean isPhone = Boolean.TRUE.equals(phoneCaptureMode.get());
+                        long now = System.currentTimeMillis();
+
+                        if (isPhone && now < phoneModeUntilMs.get()) {
+                            // do NOT respond between digit groups
+                            log.info("PHONE MODE: skip response.create on speech_stopped (waiting more digits)");
+                            return;
+                        }
 
                         sendJson(ws, "{\"type\":\"response.create\",\"response\":{\"modalities\":[\"audio\",\"text\"]}}");
-                        log.info("OPENAI sent response.create modalities=[audio,text]");
                         return;
                     }
 
@@ -262,13 +337,11 @@ Say exactly the following, word for word, without adding anything before or afte
                 }
             }
 
-            @Override
-            public void onClosing(WebSocket ws, int code, String reason) {
+            @Override public void onClosing(WebSocket ws, int code, String reason) {
                 log.error("OPENAI onClosing code={} reason={}", code, reason);
             }
 
-            @Override
-            public void onClosed(WebSocket ws, int code, String reason) {
+            @Override public void onClosed(WebSocket ws, int code, String reason) {
                 log.error("OPENAI onClosed code={} reason={}", code, reason);
             }
 
@@ -279,8 +352,8 @@ Say exactly the following, word for word, without adding anything before or afte
             }
 
             private void sendAudioToTwilio(WebSocketSession session, String streamSid, String audioB64) {
-                log.info("SEND->TWILIO media streamSid={} payloadLen={}",
-                        streamSid, audioB64 != null ? audioB64.length() : -1);
+                // Drop late deltas if we cancelled / not speaking
+                if (!assistantSpeaking.get()) return;
 
                 String msg = "{\"event\":\"media\",\"streamSid\":\"" + streamSid + "\",\"media\":{\"payload\":\"" + audioB64 + "\"}}";
                 safeSend(session, msg);
@@ -313,32 +386,22 @@ Say exactly the following, word for word, without adding anything before or afte
         if ("start".equals(event)) {
             String streamSid = n.path("start").path("streamSid").asText();
             streamSidRef.set(streamSid);
-            log.info("TWILIO start streamSid={}", streamSid);
 
             String audio;
-            int flushed = 0;
             while ((audio = pendingAudio.poll()) != null) {
-                flushed++;
-                log.info("SEND->TWILIO buffered media streamSid={} payloadLen={}",
-                        streamSid, audio != null ? audio.length() : -1);
-
                 safeSend(twilioSession,
                         "{\"event\":\"media\",\"streamSid\":\"" + streamSid + "\",\"media\":{\"payload\":\"" + audio + "\"}}");
             }
-            log.info("TWILIO start flushedBufferedAudio={}", flushed);
             return;
         }
 
         if ("media".equals(event)) {
             String payload = n.path("media").path("payload").asText();
-            log.info("TWILIO media payloadLen={}", payload != null ? payload.length() : -1);
-
             openaiWs.send("{\"type\":\"input_audio_buffer.append\",\"audio\":\"" + payload + "\"}");
             return;
         }
 
         if ("stop".equals(event)) {
-            log.info("TWILIO stop received -> closing twilio session");
             try { twilioSession.close(); } catch (Exception ignored) {}
         }
     }
